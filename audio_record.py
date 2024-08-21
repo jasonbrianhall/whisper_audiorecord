@@ -1,15 +1,18 @@
 import sys
-import torch
-from whisper import load_model
+import whisper
 import sounddevice as sd
 import numpy as np
-from PySide2.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QComboBox, QTextEdit, QMessageBox
-from PySide2.QtCore import Qt, QThread, Signal, QTimer
 import signal
+import tempfile
+#from PySide2.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QComboBox, QTextEdit, QMessageBox
+#from PySide2.QtCore import Qt, QThread, Signal, QTimer
+from PySide2.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QComboBox, QTextEdit, QMessageBox
+from PySide2.QtCore import Qt, QThread, Signal as QtSignal, QTimer
+import soundfile as sf
 
 class AudioRecorder(QThread):
-    finished = Signal(np.ndarray)
-    error = Signal(str)
+    finished = QtSignal(np.ndarray)
+    error = QtSignal(str)
 
     def __init__(self, device, samplerate=16000):
         super().__init__()
@@ -41,28 +44,34 @@ class AudioRecorder(QThread):
         self.recording = False
 
 class WhisperTranscriber(QThread):
-    finished = Signal(str)
-    error = Signal(str)
+    finished = QtSignal(str)
+    language_detected = QtSignal(str)
+    error = QtSignal(str)
 
-    def __init__(self, audio_data):
+    def __init__(self, audio_data, sample_rate):
         super().__init__()
         self.audio_data = audio_data
+        self.sample_rate = sample_rate
+        self.model = whisper.load_model("base")
 
     def run(self):
         try:
-            # Load the Whisper model
-            model = load_model("base")
-            
-            # Prepare audio data
-            audio_tensor = torch.from_numpy(self.audio_data.flatten()).float()
-            audio_tensor = audio_tensor / torch.max(torch.abs(audio_tensor))
-            
-            # Perform transcription
-            result = model.transcribe(audio_tensor)
+            # Create a temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                sf.write(temp_wav.name, self.audio_data, self.sample_rate)
+                temp_wav_path = temp_wav.name
+
+            # Transcribe the audio using the temporary file path
+            result = self.model.transcribe(temp_wav_path)
+
+            # Emit the detected language
+            self.language_detected.emit(f"Detected language: {result['language']}")
+
+            # Emit the transcribed text
             self.finished.emit(result["text"])
         except Exception as e:
             self.error.emit(str(e))
-
+            
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -71,6 +80,7 @@ class MainWindow(QWidget):
 
         self.device_combo = QComboBox()
         self.update_device_list()
+        self.device_combo.currentIndexChanged.connect(self.update_samplerate_list)
         self.layout.addWidget(self.device_combo)
 
         self.samplerate_combo = QComboBox()
@@ -98,9 +108,23 @@ class MainWindow(QWidget):
                 self.device_combo.addItem(f"{dev['name']}", i)
 
     def update_samplerate_list(self):
-        samplerates = [8000, 16000, 22050, 44100, 48000]
-        for rate in samplerates:
-            self.samplerate_combo.addItem(f"{rate} Hz", rate)
+        device_id = self.device_combo.currentData()
+        if device_id is not None:
+            device_info = sd.query_devices(device_id, 'input')
+            supported_samplerates = self.get_supported_samplerates(device_info)
+            self.samplerate_combo.clear()
+            for rate in supported_samplerates:
+                self.samplerate_combo.addItem(f"{rate} Hz", rate)
+
+    def get_supported_samplerates(self, device_info):
+        supported = []
+        for rate in [8000, 16000, 22050, 44100, 48000]:
+            try:
+                sd.check_input_settings(device=device_info['index'], samplerate=rate)
+                supported.append(rate)
+            except sd.PortAudioError:
+                pass
+        return supported
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -111,6 +135,9 @@ class MainWindow(QWidget):
     def start_recording(self):
         device = self.device_combo.currentData()
         samplerate = self.samplerate_combo.currentData()
+        if device is None or samplerate is None:
+            QMessageBox.warning(self, "Error", "Please select a device and sample rate.")
+            return
         self.recorder = AudioRecorder(device, samplerate)
         self.recorder.finished.connect(self.on_recording_finished)
         self.recorder.error.connect(self.on_error)
@@ -126,13 +153,16 @@ class MainWindow(QWidget):
             self.record_button.setText("Record")
 
     def on_recording_finished(self, audio_data):
-        self.transcriber = WhisperTranscriber(audio_data)
+        sample_rate = self.samplerate_combo.currentData()
+        self.transcriber = WhisperTranscriber(audio_data, sample_rate)
         self.transcriber.finished.connect(self.on_transcription_finished)
         self.transcriber.error.connect(self.on_error)
         self.transcriber.start()
 
     def on_transcription_finished(self, text):
         self.transcription_text.setPlainText(text)
+        print("Transcription:")
+        print(text)  # Print the transcription to the CLI
 
     def on_error(self, error_message):
         QMessageBox.critical(self, "Error", error_message)
