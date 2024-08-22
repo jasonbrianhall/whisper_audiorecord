@@ -48,14 +48,18 @@ class WhisperTranscriber(QThread):
     language_detected = QtSignal(str)
     error = QtSignal(str)
 
-    def __init__(self, audio_data, sample_rate):
+    def __init__(self, audio_data, sample_rate, model_name):
         super().__init__()
         self.audio_data = audio_data
         self.sample_rate = sample_rate
-        self.model = whisper.load_model("base")
+        self.model_name = model_name
+        self.model = None
 
     def run(self):
         try:
+            # Load the selected model
+            self.model = whisper.load_model(self.model_name)
+
             # Create a temporary WAV file
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                 sf.write(temp_wav.name, self.audio_data, self.sample_rate)
@@ -86,6 +90,11 @@ class MainWindow(QWidget):
         self.samplerate_combo = QComboBox()
         self.update_samplerate_list()
         self.layout.addWidget(self.samplerate_combo)
+
+        # Add model selection combo box
+        self.model_combo = QComboBox()
+        self.update_model_list()
+        self.layout.addWidget(self.model_combo)
 
         self.record_button = QPushButton("Record")
         self.record_button.clicked.connect(self.toggle_recording)
@@ -172,6 +181,19 @@ class MainWindow(QWidget):
         if self.recorder:
             self.recorder.wait()
         event.accept()
+        
+    def update_model_list(self):
+        models = ["tiny", "base", "small", "medium", "large"]
+        for model in models:
+            self.model_combo.addItem(model)
+
+    def on_recording_finished(self, audio_data):
+        sample_rate = self.samplerate_combo.currentData()
+        model_name = self.model_combo.currentText()
+        self.transcriber = WhisperTranscriber(audio_data, sample_rate, model_name)
+        self.transcriber.finished.connect(self.on_transcription_finished)
+        self.transcriber.error.connect(self.on_error)
+        self.transcriber.start()
 
 class Application(QApplication):
     def __init__(self, argv):
